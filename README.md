@@ -1,2 +1,2 @@
 # Programmers Scoring
-This code is scoring skills of the programmers based on their information gathered from GitHub and Stackoverflow. It is to help recruiters evaluate and choose the right programmer.
+Scoring skills of programmers based on their GitHub and Stackoverflow data. It is to help recruiters evaluate and choose the right candidate for programmer role. The final scoring result is a function of multiple GitHub / Stackoverflow user parameters.
