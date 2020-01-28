@@ -1,0 +1,605 @@
+---
+title: "InnoBench / Data / Advanced Sourcing"
+output: html_notebook
+date: '2020-01-20'
+---
+
+# Stack Overflow - eksploracyjna analiza danych  {.tabset}
+
+```{r results = 'hide', echo = F, error = F, warning = F, message = F}
+library(RMySQL)
+library(dplyr)
+library(plotly)
+library(lubridate)
+library(wordcloud)
+library(data.table)
+
+db <- dbConnect(dbDriver('MySQL'), user = '###', password = '###', 
+                 dbname = 'stackoverflow', host = '###', port = 3306)
+badges <- dbReadTable(db, "badges")
+users <- dbReadTable(db, "users")
+users$Id <- as.numeric(users$Id)
+posts <- dbReadTable(db, "posts")
+post_tags <- dbReadTable(db, "posttags")
+supertags <- dbReadTable(db, "supertags")
+posttypes <- dbReadTable(db, "posttypes")
+```
+
+## Kalkulacje oceny
+
+### Wskaźniki oceny kandydata
+
+Poniżej przedstawione są kalkulacje poszczególnych wskaźników oceny kandydata (zaproponowanych przez Beniamina), na przykładzie jednego użytkownika.
+
+***
+
+#### 1. Count all answers in a tag (skill)
+INPUT:  Users.Id
+
+RESULT: User’s number of answers per Tags.CalculatedTagGroup which he had given any answer
+
+```{r error = F, warning = F, message = F}
+"SELECT u.DisplayName, t.CalculatedTagGroup, COUNT(*) AS NumberOfAnswersPerCalculatedTagGroup
+FROM Posts p
+JOIN PostTags pt ON p.ParentId = pt.PostId
+JOIN Tags t ON t.TagName = pt.TagName
+JOIN Users u ON u.Id = p.OwnerUserId
+WHERE u.Id = 422489 AND p.PostTypeId = 2
+GROUP BY u.DisplayName, t.CalculatedTagGroup
+ORDER BY u.DisplayName, NumberOfAnswersPerCalculatedTagGroup DESC" -> sql1
+dbGetQuery(db, sql1)
+```
+
+***
+
+#### 2. Calculate percentage of "accepted" answers out of all answers per tag (skill)
+INPUT:  Users.Id
+
+RESULT: User’s Percentage of accepted answers
+
+percentage of "accepted" answers = NumerOfAcceptedAnswersPerCalculatedTagGroup/NumberOfAnswersPerCalculatedTagGroup (from point 1)
+
+```{r error = F, warning = F, message = F}
+"SELECT u.Id, u.DisplayName, t.CalculatedTagGroup, COUNT(*) AS NumberOfAcceptedAnswersPerCalculatedTagGroup
+FROM Posts pa
+JOIN Posts pq ON pq.Id = pa.ParentId
+JOIN PostTags pt ON pt.PostId = pa.ParentId
+JOIN Tags t ON (t.Tagname = pt.Tagname)
+JOIN Users u ON u.Id = pa.OwnerUserId
+WHERE pq.AcceptedAnswerId = pa.Id AND pa.PostTypeId = 2 AND u.Id = 422489
+GROUP BY u.Id, u.DisplayName, t.CalculatedTagGroup
+ORDER BY u.DisplayName, NumberOfAcceptedAnswersPerCalculatedTagGroup DESC" -> sql2
+dbGetQuery(db, sql2)
+```
+
+***
+
+#### 3. Calculate avarage score from answers per tag (skill)
+INPUT:  Users.Id
+
+RESULT: User’s average scores of answers per Tags.CalculatedTagGroup
+
+average scores of answers per Tags.CalculatedTagGroup = SumOfScorePerTag/NumberOfAnswersPerCalculatedTagGroup
+
+```{r error = F, warning = F, message = F}
+"SELECT u.DisplayName, t.CalculatedTagGroup, SUM(p.Score) AS SumOfScorePerTag, SUM(p.Score) / COUNT(*) AS AvarageSumOfScorePerTag
+FROM Posts p
+JOIN PostTags pt ON p.ParentId = pt.PostId
+JOIN Tags t ON t.TagName = pt.TagName
+JOIN Users u ON u.Id = p.OwnerUserId
+WHERE u.Id = 422489 AND p.PostTypeId = 2
+GROUP BY u.DisplayName, t.CalculatedTagGroup
+ORDER BY u.DisplayName, AvarageSumOfScorePerTag DESC" -> sql3
+dbGetQuery(db, sql3)
+```
+
+***
+
+#### 4. Calculate median of percentage of candidates answers out of total answers under a post
+INPUT:  Users.Id
+
+RESULT: User’s median of percentage answers per question
+
+median of percentage of candidates answers out of total answers under a post = NumberOfUserAnswers / NumberOfPostAnswers
+
+##### a) find all Tags.CalculatedTagGroup which User.Id has written any answer
+
+```{r error = F, warning = F, message = F}
+"SELECT u.Id, u.DisplayName, t.CalculatedTagGroup
+FROM Posts p
+JOIN PostTags pt ON p.ParentId = pt.PostId
+JOIN Tags t ON t.TagName = pt.TagName
+JOIN Users u ON u.Id = p.OwnerUserId
+WHERE u.Id = 422489 AND p.PostTypeId = 2
+GROUP BY u.DisplayName, t.CalculatedTagGroup
+ORDER BY u.DisplayName, t.CalculatedTagGroup" -> sql4a
+dbGetQuery(db, sql4a)
+```
+
+##### b) for each Tags.CalculatedTagGroup from a) we have to calculate percentage of User.Id answers out of total answers under a post teh tocalculate mediana of this percentage.
+
+```{r error = F, warning = F, message = F}
+"SELECT u.Id, u.DisplayName, pa.Id, t.CalculatedTagGroup, SUM(pq.AnswerCount) AS NumberOfPostAnswers, COUNT(*) AS NumberOfUserAnswers, COUNT(*) / SUM(pq.AnswerCount)
+FROM Posts pa
+JOIN Posts pq ON pq.Id = pa.ParentId
+JOIN PostTags pt ON pt.PostId = pa.ParentId
+JOIN Tags t ON (t.Tagname = pt.Tagname)
+JOIN Users u ON u.Id = pa.OwnerUserId
+WHERE pa.PostTypeId = 2 AND u.Id = 422489 AND t.CalculatedTagGroup = 'c++'
+GROUP BY u.Id, u.DisplayName, t.CalculatedTagGroup, pa.Id
+ORDER BY u.DisplayName, t.CalculatedTagGroup" -> sql4b
+dbGetQuery(db, sql4b)
+```
+
+
+
+
+## Analiza userów
+
+```{r echo = F, error = F, warning = F, message = F}
+users_repu <- users %>%
+  count(repu = as.numeric(Reputation)) %>%
+  mutate(binned_repu = cut(repu, breaks = c(0, 1, 25, 50, 100, 100000000))) %>%
+  group_by(binned_repu) %>%
+  summarise(n = sum(n, na.rm = T)) %>%
+  mutate(percent = round(n/sum(n),2))
+```
+
+### Reputacja
+#### Pełna historia od 2008
+Poniżej zaprezentowane są segmenty użytkowników w podziale na ich punkty reputacji. 1 punkt nadawany jest automatycznie dla każdego konta, czyli są to konta bez punktowanej aktywności. Wydaje się, że za aktywnych użytkowników - takich, że ich aktywność jest wystarczająca by móc ich ocenić - należy uznać użytkowników z minimum 100 punktami reputacji. 100 punktów oznacza [w przybliżeniu] mniej niż 5 postów i/lub mniej niż 5 otrzymanych vote'ów.
+
+Metodę liczenia punktów reputacji można przeczytać tutaj: [What is Reputation?](https://stackoverflow.com/help/whats-reputation).
+
+You gain reputation when:
+
+* question is voted up: +10
+* answer is voted up: +10
+* answer is marked “accepted”: +15 (+2 to acceptor)
+* suggested edit is accepted: +2 (up to +1000 total per user)
+* bounty awarded to your answer: + full bounty amount
+* one of your answers is awarded a bounty automatically: + half of the bounty amount (see more details about how bounties work)
+* site association bonus: +100 on each site (awarded a maximum of one time per site)
+
+```{r echo = F, error = F, warning = F, message = F}
+plot_ly(users_repu, labels = ~binned_repu, values = ~n, type = 'pie', sort = F) %>%
+  layout(title = 'Liczba punktów reputacji')
+```
+
+
+
+
+
+## Analiza postów
+
+```{r echo = F, error = F, warning = F, message = F}
+user_posts <- posts %>%
+  filter(PostTypeId %in% c(1,2) & OwnerUserId %in% users$Id)
+
+posts_count <- user_posts %>%
+  count(OwnerUserId, PostTypeId)
+posts_count <- dcast(posts_count, OwnerUserId ~ PostTypeId, value.var = "n", fun.aggregate = sum, na.rm = T)
+colnames(posts_count) <- c("OwnerUserId", "question_count", "answer_count")
+
+posts_count <- left_join(users, posts_count, by = c("Id" = "OwnerUserId")) %>%
+  select(Id, question_count, answer_count)
+posts_count[is.na(posts_count)] <- 0
+
+posts_count <- posts_count %>%
+  mutate(binned_number_of_questions = cut(question_count, breaks = c(-1, 0, 1, 5, 100000)),
+         binned_number_of_answers = cut(answer_count, breaks = c(-1, 0, 1, 5, 100000)))
+
+posts_count <- posts_count %>%
+  count(binned_number_of_questions, binned_number_of_answers) %>%
+  arrange(desc(n))
+
+posts_count <- posts_count %>%
+  mutate(percent = round(n/sum(n),2))
+```
+
+### Segmenty użytkowników
+#### Pełna historia od 2008
+Poniżej zaprezentowane są segmenty użytkowników w podziale na liczbę udzielonych pytań i odpowiedzi. Wydaje się, że za aktywnych użytkowników - takich, że ich aktywność jest wystarczająca by móc ich ocenić - należy uznać użytkowników z minimum 5 postami, w szczególności jeśli mając mniej niż 5 postów, nie otrzymano żadnych vote'ów.
+
+Legenda:
+
+Etykieta | Opis
+--- | ---
+(-1,0] | 0 postów
+(0,1] | 1 post
+(1,5] | 2-5 postów
+(5, 1e+05] | powyżej 5 postów
+
+```{r echo = F, error = F, warning = F, message = F}
+user_posts <- posts %>%
+  filter(PostTypeId %in% c(1,2) & OwnerUserId %in% users$Id)
+
+posts_count <- user_posts %>%
+  count(OwnerUserId, PostTypeId)
+posts_count <- dcast(posts_count, OwnerUserId ~ PostTypeId, value.var = "n", fun.aggregate = sum, na.rm = T)
+colnames(posts_count) <- c("OwnerUserId", "question_count", "answer_count")
+
+posts_count <- left_join(users, posts_count, by = c("Id" = "OwnerUserId")) %>%
+  select(Id, question_count, answer_count)
+posts_count[is.na(posts_count)] <- 0
+
+posts_count <- posts_count %>%
+  mutate(binned_number_of_questions = cut(question_count, breaks = c(-1, 0, 1, 5, 100000)),
+         binned_number_of_answers = cut(answer_count, breaks = c(-1, 0, 1, 5, 100000)))
+
+posts_count <- posts_count %>%
+  count(binned_number_of_questions, binned_number_of_answers) %>%
+  arrange(desc(n))
+
+posts_count <- posts_count %>%
+  mutate(percent = round(n/sum(n),2))
+```
+
+```{r echo = F, error = F, warning = F, message = F}
+plot_ly(posts_count, x = ~binned_number_of_questions, y = ~binned_number_of_answers, 
+        text = ~paste0("Liczba obs. = ", n, ", Procent = ", percent),
+        type = 'scatter', mode = 'markers', marker = list(size = ~n/100, opacity = 0.5)) %>%
+  layout(title = 'Segmentacja użytkowników względem liczby postów',
+         xaxis = list(title = "Liczba pytań"),
+         yaxis = list(title = "Liczba odpowiedzi"))
+```
+
+***
+
+#### Świeże posty
+Poniżej zaprezentowane są segmenty użytkowników biorąc pod uwagę tylko posty z ostatnich 3 lat.
+```{r echo = F, error = F, warning = F, message = F}
+fresh_user_posts <- posts %>%
+  filter(PostTypeId %in% c(1,2) & OwnerUserId %in% users$Id & as.Date(CreationDate) >= today() - (365*3))
+
+fresh_posts_count <- fresh_user_posts %>%
+  count(OwnerUserId, PostTypeId)
+fresh_posts_count <- dcast(fresh_posts_count, OwnerUserId ~ PostTypeId, value.var = "n", fun.aggregate = sum, na.rm = T)
+colnames(fresh_posts_count) <- c("OwnerUserId", "question_count", "answer_count")
+
+fresh_posts_count <- left_join(users, fresh_posts_count, by = c("Id" = "OwnerUserId")) %>%
+  select(Id, question_count, answer_count)
+fresh_posts_count[is.na(fresh_posts_count)] <- 0
+
+fresh_posts_count <- fresh_posts_count %>%
+  mutate(binned_number_of_questions = cut(question_count, breaks = c(-1, 0, 1, 5, 100000)),
+         binned_number_of_answers = cut(answer_count, breaks = c(-1, 0, 1, 5, 100000)))
+
+fresh_posts_count <- fresh_posts_count %>%
+  count(binned_number_of_questions, binned_number_of_answers) %>%
+  arrange(desc(n))
+
+fresh_posts_count <- fresh_posts_count %>%
+  mutate(percent = round(n/sum(n),2))
+```
+
+```{r echo = F, error = F, warning = F, message = F}
+plot_ly(fresh_posts_count, x = ~binned_number_of_questions, y = ~binned_number_of_answers, 
+        text = ~paste0("Liczba obs. = ", n, ", Procent = ", percent),
+        type = 'scatter', mode = 'markers', marker = list(size = ~n/100, opacity = 0.5)) %>%
+  layout(title = 'Segmentacja użytkowników - ostatnie 3 lata',
+         xaxis = list(title = "Liczba pytań"),
+         yaxis = list(title = "Liczba odpowiedzi"))
+```
+
+***
+
+### Analiza odpowiedzi
+
+```{r results = F, echo = F, error = F, warning = F, message = F}
+answerId <- posttypes %>%
+  filter(Name == "Answer")
+
+posts_answers <- posts %>%
+  filter(PostTypeId == answerId[1,1] & OwnerUserId %in% users$Id) %>%
+  mutate(CreationDate = as.Date(CreationDate))
+```
+
+```{r echo = F, error = F, warning = F, message = F}
+answers_count <- posts_answers %>%
+  group_by(OwnerUserId) %>%
+  summarise(count = n())
+
+answers_count <- left_join(users, answers_count, by = c("Id" = "OwnerUserId")) %>%
+  select(Id, count)
+
+answers_count[is.na(answers_count)] <- 0
+
+answers_count <- answers_count %>%
+  group_by(number_of_answers = count) %>%
+  summarise(count = n()) %>%
+  data.frame() %>%
+  mutate(binned_number_of_answers = cut(number_of_answers, breaks = c(-1, 0, 1, 5, 10, 100, 100000))) %>%
+  group_by(binned_number_of_answers) %>%
+  summarise(count = sum(count))
+```
+
+#### Liczba odpowiedzi użytkowników - pełna historia od 2008
+
+Większość użytkowników (`r as.numeric(100*round(answers_count[1,2]/sum(answers_count$count),4))`%) nigdy nie napisała żadnej odpowiedzi. Kolejne `r as.numeric(100*round(answers_count[2,2]/sum(answers_count$count),4))`% napisało tylko 1 odpowiedź, `r as.numeric(100*round(answers_count[3,2]/sum(answers_count$count),4))`% napisało pomiędzy 1 a 5 odpowiedzi. Kolejne przedziały liczby odpowiedzi są zaprezentowane na poniższym wykresie.
+
+```{r echo = F, error = F, warning = F, message = F}
+plot_ly(answers_count, labels = ~binned_number_of_answers, values = ~count, type = 'pie', sort = F) %>%
+  layout(title = 'Liczba odpowiedzi napisanych przez użytkowników')
+```
+
+***
+
+#### Liczba odpowiedzi w czasie
+Odpowiedzi istniejące w bazie pochodzą z okresu `r as.Date(min(posts_answers$CreationDate))` - `r as.Date(max(posts_answers$CreationDate))`. Widać, że lata 2008 - 2013 były czasem wzrostu wolumenu odpowiedzi, podczas gdy od 2013 miesięczna liczba odpowiedzi ustabilizowała się. Prezentuje to poniższy wykres.
+```{r echo = F, error = F, warning = F, message = F}
+answers_dates <- posts_answers %>%
+  group_by(creation_date = CreationDate) %>%
+  summarise(count = n())
+
+creation_dates <- data.frame(creation_date = seq(as.Date(min(answers_dates$creation_date)),
+                                                 as.Date(max(answers_dates$creation_date)),
+                                                 by = "day"))
+
+answers_dates <- left_join(creation_dates, answers_dates) %>%
+  arrange(creation_date) %>%
+  group_by(creation_date = format(creation_date, '%Y-%m')) %>%
+  summarise(count = sum(count, na.rm = T))
+
+plot_ly(answers_dates, x = ~creation_date, y = ~count, type = 'scatter', mode = 'lines') %>%
+  layout(title = 'Liczba odpowiedzi w zależności od CreationDate')
+```
+
+***
+
+#### Liczba świeżych odpowiedzi użytkowników
+Aby uzyskać aktualną informację o zaangażowaniu użytkownika na platformie warto ograniczyć analizę tylko do wpisów np. z ostatnich 3 lat. 
+```{r echo = F, error = F, warning = F, message = F}
+fresh_answers_count <- posts_answers %>%
+  filter(CreationDate >= today() - (365*3)) %>%
+  group_by(OwnerUserId) %>%
+  summarise(count = n())
+
+fresh_answers_count <- left_join(users, fresh_answers_count, by = c("Id" = "OwnerUserId")) %>%
+  select(Id, count)
+
+fresh_answers_count[is.na(fresh_answers_count)] <- 0
+
+fresh_answers_count <- fresh_answers_count %>%
+  group_by(number_of_answers = count) %>%
+  summarise(count = n()) %>%
+  data.frame() %>%
+  mutate(binned_number_of_answers = cut(number_of_answers, breaks = c(-1, 0, 1, 5, 10, 100, 100000))) %>%
+  group_by(binned_number_of_answers) %>%
+  summarise(count = sum(count))
+```
+
+Ograniczając odpowiedzi tylko do ostatnich 3 lat widać, że ogólny poziom zaangażowania jest niższy niż analizując całą bazę danych. Większość użytkowników (`r as.numeric(100*round(fresh_answers_count[1,2]/sum(fresh_answers_count$count),4))`%) nigdy nie napisała żadnej odpowiedzi. Kolejne `r as.numeric(100*round(fresh_answers_count[2,2]/sum(fresh_answers_count$count),4))`% napisało tylko 1 odpowiedź, `r as.numeric(100*round(fresh_answers_count[3,2]/sum(fresh_answers_count$count),4))`% napisało pomiędzy 1 a 5 odpowiedzi. Kolejne przedziały liczby odpowiedzi są zaprezentowane na poniższym wykresie.
+
+```{r echo = F, error = F, warning = F, message = F}
+plot_ly(fresh_answers_count, labels = ~binned_number_of_answers, values = ~count, type = 'pie', sort = F) %>%
+  layout(title = 'Liczba odpowiedzi - ostatnie 3 lata')
+```
+
+***
+
+### Analiza pytań
+
+```{r echo = F, error = F, warning = F, message = F}
+questionId <- posttypes %>%
+  filter(Name == "Question")
+
+posts_questions <- posts %>%
+  filter(PostTypeId == questionId[1,1] & OwnerUserId %in% users$Id) %>%
+  mutate(CreationDate = as.Date(CreationDate))
+```
+
+```{r echo = F, error = F, warning = F, message = F}
+questions_count <- posts_questions %>%
+  group_by(OwnerUserId) %>%
+  summarise(count = n())
+
+questions_count <- left_join(users, questions_count, by = c("Id" = "OwnerUserId")) %>%
+  select(Id, count)
+
+questions_count[is.na(questions_count)] <- 0
+
+questions_count <- questions_count %>%
+  group_by(number_of_questions = count) %>%
+  summarise(count = n()) %>%
+  data.frame() %>%
+  mutate(binned_number_of_questions = cut(number_of_questions, breaks = c(-1, 0, 1, 5, 10, 100, 100000))) %>%
+  group_by(binned_number_of_questions) %>%
+  summarise(count = sum(count))
+```
+
+#### Liczba pytań użytkowników
+
+Istotnie większa część użytkowników zapostowała co najmniej jedno pytanie niż odpowiedź - `r 100-as.numeric(100*round(questions_count[1,2]/sum(questions_count$count),4))`% vs `r 100-as.numeric(100*round(answers_count[1,2]/sum(answers_count$count),4))`%
+
+Większość użytkowników (`r as.numeric(100*round(questions_count[1,2]/sum(questions_count$count),4))`%) nigdy nie napisała żadnego pytania. Kolejne `r as.numeric(100*round(questions_count[2,2]/sum(questions_count$count),4))`% napisało tylko 1 pytanie, `r as.numeric(100*round(questions_count[3,2]/sum(questions_count$count),4))`% napisało pomiędzy 1 a 5 pytaniami. Kolejne przedziały liczby pytań są zaprezentowane na poniższym wykresie.
+
+```{r echo = F, error = F, warning = F, message = F}
+plot_ly(questions_count, labels = ~binned_number_of_questions, values = ~count, type = 'pie', sort = F) %>%
+  layout(title = 'Liczba pytań napisanych przez użytkowników')
+```
+
+***
+
+#### Liczba pytań w czasie
+Pytania istniejące w bazie pochodzą z okresu `r as.Date(min(posts_questions$CreationDate))` - `r as.Date(max(posts_questions$CreationDate))`. Tu, w odróżnieniu od odpowiedzi, mamy do czynienia z trendem stale rosnącym. Może to oznaczać, że popyt na wiedzę wciąż rośnie, jednak podaż odpowiadających się ustabilizowała kilka lat temu i nie przyrasta proporcjonalnie do popytu.
+```{r echo = F, error = F, warning = F, message = F}
+questions_dates <- posts_questions %>%
+  group_by(creation_date = CreationDate) %>%
+  summarise(count = n())
+
+creation_dates <- data.frame(creation_date = seq(as.Date(min(questions_dates$creation_date)),
+                                                 as.Date(max(questions_dates$creation_date)),
+                                                 by = "day"))
+
+questions_dates <- left_join(creation_dates, questions_dates) %>%
+  arrange(creation_date) %>%
+  group_by(creation_date = format(creation_date, '%Y-%m')) %>%
+  summarise(count = sum(count, na.rm = T))
+
+plot_ly(questions_dates, x = ~creation_date, y = ~count, type = 'scatter', mode = 'lines') %>%
+  layout(title = 'Liczba pytań w zależności od CreationDate')
+```
+
+#### Liczba świeżych pytań użytkowników
+Aby uzyskać aktualną informację o zaangażowaniu użytkownika na platformie warto ograniczyć analizę tylko do wpisów np. z ostatnich 3 lat. 
+```{r echo = F, error = F, warning = F, message = F}
+fresh_questions_count <- posts_questions %>%
+  filter(CreationDate >= today() - (365*3)) %>%
+  group_by(OwnerUserId) %>%
+  summarise(count = n())
+
+fresh_questions_count <- left_join(users, fresh_questions_count, by = c("Id" = "OwnerUserId")) %>%
+  select(Id, count)
+
+fresh_questions_count[is.na(fresh_questions_count)] <- 0
+
+fresh_questions_count <- fresh_questions_count %>%
+  group_by(number_of_questions = count) %>%
+  summarise(count = n()) %>%
+  data.frame() %>%
+  mutate(binned_number_of_questions = cut(number_of_questions, breaks = c(-1, 0, 1, 5, 10, 100, 100000))) %>%
+  group_by(binned_number_of_questions) %>%
+  summarise(count = sum(count))
+```
+
+Ograniczając pytania tylko do ostatnich 3 lat widać, że ogólny poziom zaangażowania jest niższy niż analizując całą bazę danych. Większość użytkowników (`r as.numeric(100*round(fresh_questions_count[1,2]/sum(fresh_questions_count$count),4))`%) nigdy nie napisała żadnego pytania. Kolejne `r as.numeric(100*round(fresh_questions_count[2,2]/sum(fresh_questions_count$count),4))`% napisało tylko 1 pytanie, `r as.numeric(100*round(fresh_questions_count[3,2]/sum(fresh_questions_count$count),4))`% napisało pomiędzy 1 a 5 pytaniami. Kolejne przedziały liczby pytań są zaprezentowane na poniższym wykresie.
+
+```{r echo = F, error = F, warning = F, message = F}
+plot_ly(fresh_questions_count, labels = ~binned_number_of_questions, values = ~count, type = 'pie', sort = F) %>%
+  layout(title = 'Liczba pytań - ostatnie 3 lata')
+```
+
+***
+
+### Pozostałe typy postów
+W Stackoverflow jest zdefiniowane kilka typów postów, poza najpopularniejszymi czyli pytaniami i odpowiedziami. Jednak inne typy postów niż te analizowane powyżej są zaniedbywalnie rzadkie, więc pomijamy je w analizie. Ich rozkład jest zaprezentowany poniżej.
+
+```{r}
+left_join(posts, posttypes, by = c("PostTypeId" = "Id")) %>% count(PostTypeName = Name) %>% arrange(desc(n))
+```
+
+
+
+## Analiza tagów
+
+### Liczebności tagów
+```{r echo = F, error = F, warning = F, message = F}
+tags_count <- post_tags %>%
+  count(TagName) %>%
+  arrange(desc(n))
+
+tags_density <- tags_count %>%
+  mutate(perc = n/sum(n, na.rm = T),
+         cum_perc = round(cumsum(perc),2),
+         binned_cum_perc = cut(cum_perc, breaks = c(0, 0.25, 0.5, 0.75, 1))) %>%
+  group_by(binned_cum_perc) %>%
+  summarise(number_of_tags = n())
+```
+
+W naszej bazie postów występuje `r nrow(tags_count)` unikalnych tagów. Rozkład ćwiartkowy występowania wszystkich tagów wygląda następująco:
+
+* 25% wszystkich występujących tagów to `r as.numeric(tags_density[1,2])` unikalnych tagów, a dokładnie: `r as.character(tags_count[1:as.integer(tags_density[1,2]),1])`
+* Kolejne 25% wszystkich tagów to `r as.numeric(tags_density[2,2])` unikalnych tagów
+* Kolejne 25% wszystkich tagów to `r as.numeric(tags_density[3,2])` unikalnych tagów
+* Ostatnie 25% wszystkich tagów to `r as.integer(tags_density[4,2])` unikalnych tagów
+
+***
+
+### Chmura słów
+Poniżej zaprezentowany jest rozkład najpopularniejszych tagów (występujących więcej niż 350 razy) zgodnie z częstością ich występowania w postach. Im większy rozmiar słowa, tym częściej występuje.
+
+Jak widać, najczęstsze tagi oznaczają języki programowania (java, python, c#) lub popularne elementy programistyczne (regex, arrays, json)
+```{r echo = F, error = F, warning = F, message = F}
+wordcloud(tags_count$TagName, tags_count$n, min.freq = 350, scale=c(5, .2), random.order = FALSE)
+```
+
+***
+
+### Supertagi
+W celu ułatwienia interpretacji tagów, których jest aż `r nrow(tags_count)` wykonaliśmy ich grupowanie do "supertagów". Metoda grupowania wykorzystuje fakt, że do większości postów przypisane są co najmniej 2 tagi. Sprawdzamy, który z nich jest popularniejszy ogółem i dla każdego posta przypisujemy ten najpopularniejszy jako supertag do wszystkich pozostałych tagów. Jeżeli w większości postów z naszej bazy danych dany tag jest przypisany do danego supertaga, to uznajemy te grupowanie za zasadne. Jeśli jednak występują różne supertagi i żaden nie stanowi większości, to nie przypisujemy żadnego supertaga.
+
+Poniższa chmura prezentuje wszystkie supertagi, które wytworzyliśmy, `r nrow(supertags_count)` sztuk. Pokrywają one ca. 85% wystąpień wszystkich tagów w postach.
+
+```{r echo = F, error = F, warning = F, message = F}
+supertags_count <- supertags %>%
+  group_by(Supertag) %>%
+  summarise(n = sum(N_obs, na.rm = T))
+
+wordcloud(supertags_count$Supertag, supertags_count$n, min.freq = 0, scale=c(5, .2), random.order = FALSE)
+```
+
+## Opis bazy danych
+
+### Wszystkie tabele
+```{r echo = F, error = F, warning = F, message = F}
+db <- dbConnect(dbDriver('MySQL'), user = 'jaroslaw.bontruk@itm-innovation-mysql', password = 'q8yrBy4E3UaxgYgt', 
+                 dbname = 'stackoverflow', host = 'itm-innovation-mysql.mysql.database.azure.com', port = 3306)
+```
+
+``` {r}
+dbListTables(db)
+```
+
+Lista tabel w bazie *stackoverflow @ itm-innovation-mysql.mysql.database.azure.com:3306*
+
+Tabele nadające się do wykorzystania to: 
+
+* *Badges* - informacje o Badge'ach użytkowników
+* *PostTags* - tagi przypisane do postów
+* *Posts* - lista pytań i odpowiedzi
+* *Users* - informacje na temat użytkowników
+
+Wszystkie 4 tabele są zaprezentowane poniżej.
+
+***
+
+### Tabela Badges
+```{r}
+colnames(badges)
+```
+Lista kolumn w tabeli *Badges* (informacje o Badge'ach użytkowników). Tabela zawiera `r nrow(badges)` rekordów i `r length(unique(badges$Name))` unikalnych *Badges.Name*.
+
+```{r}
+head(badges, 10)
+```
+Prezentacja danych w tabeli *Badges*
+
+***
+
+### Tabela PostTags
+```{r}
+colnames(post_tags)
+```
+Lista kolumn w tabeli *PostTags* (tagi przypisane do postów). Tabela zawiera `r nrow(post_tags)` rekordów, w tym `r length(unique(post_tags$TagName))` unikalnych *PostTags.TagName*.
+
+```{r}
+head(post_tags, 10)
+```
+Prezentacja danych w tabeli *PostTags*
+
+***
+
+### Tabela Posts
+```{r}
+colnames(posts)
+```
+Lista kolumn w tabeli *Posts* (lista pytań i odpowiedzi). Tabela zawiera `r nrow(posts)` rekordów, w tym `r length(unique(posts$ParentId))` pytań i `r nrow(posts) - length(unique(posts$ParentId))` odpowiedzi.
+
+```{r}
+head(posts, 10)
+```
+Prezentacja danych w tabeli *Posts*
+
+***
+
+### Tabela Users
+```{r}
+colnames(users)
+```
+Lista kolumn w tabeli *Users* (informacje na temat użytkowników). Tabela zawiera `r nrow(users)` rekordów, w tym `r length(unique(users$Id))` unikalnych User ID.
+
+```{r}
+head(users, 10)
+```
+Prezentacja danych w tabeli *Users*
